@@ -1,5 +1,5 @@
 # api_server.py
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from datetime import datetime
 from task_queue_system import (
@@ -34,12 +34,54 @@ def tm_or_503():
     return task_manager, None
 
 
+# ---------- Public Endpoints ----------
+
+@app.get("/")
+def index():
+    """Friendly landing for recruiters—redirect to examples."""
+    return redirect("/examples", code=302)
+
+
 @app.get('/health')
 def health_check():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
         'service': 'task-queue-api'
+    })
+
+
+@app.get('/examples')
+def get_examples():
+    """Show quick-start examples so anyone can try the API immediately."""
+    return jsonify({
+        'submit_simple_task': {
+            'method': 'POST',
+            'url': '/tasks',
+            'body': {'func_name': 'add', 'args': [10, 20]}
+        },
+        'submit_priority_task': {
+            'method': 'POST',
+            'url': '/tasks',
+            'body': {'func_name': 'multiply', 'args': [5, 6], 'priority': 'HIGH', 'max_retries': 5}
+        },
+        'submit_task_with_kwargs': {
+            'method': 'POST',
+            'url': '/tasks',
+            'body': {'func_name': 'simulate_work', 'kwargs': {'duration': 3, 'fail': False}}
+        },
+        'submit_bulk_tasks': {
+            'method': 'POST',
+            'url': '/tasks/bulk',
+            'body': {'tasks': [
+                {'func_name': 'add', 'args': [1, 2]},
+                {'func_name': 'multiply', 'args': [3, 4], 'priority': 'HIGH'}
+            ]}
+        },
+        'get_task_status': {'method': 'GET', 'url': '/tasks/{task_id}'},
+        'get_all_tasks': {'method': 'GET', 'url': '/tasks?status=completed&limit=10'},
+        'get_stats': {'method': 'GET', 'url': '/stats'},
+        'get_available_tasks': {'method': 'GET', 'url': '/tasks/types'}
     })
 
 
@@ -66,7 +108,7 @@ def submit_task():
                 'error': f'Invalid priority. Must be one of: {[p.name for p in TaskPriority]}'
             }), 400
 
-        # NOTE: pass args/kwargs by name to avoid "multiple values for func_name"
+        # Named args to avoid "multiple values" collisions
         task_id = tm.submit_task(
             func_name=func_name,
             args=args,
@@ -76,6 +118,58 @@ def submit_task():
         )
 
         return jsonify({'task_id': task_id, 'status': 'submitted'}), 201
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.post('/tasks/bulk')
+def submit_bulk_tasks():
+    tm, err = tm_or_503()
+    if err:
+        return err
+    try:
+        data = request.get_json()
+        if not data or 'tasks' not in data:
+            return jsonify({'error': 'tasks array is required'}), 400
+
+        submitted, errors = [], []
+        for i, t in enumerate(data['tasks']):
+            try:
+                func_name = t.get('func_name')
+                if not func_name:
+                    errors.append(f'Task {i}: func_name is required')
+                    continue
+
+                args = t.get('args', [])
+                kwargs = t.get('kwargs', {})
+                priority = t.get('priority', 'NORMAL')
+                max_retries = t.get('max_retries', 3)
+
+                try:
+                    priority_enum = TaskPriority[priority.upper()]
+                except KeyError:
+                    errors.append(f'Task {i}: Invalid priority {priority}')
+                    continue
+
+                tid = tm.submit_task(
+                    func_name=func_name,
+                    args=args,
+                    kwargs=kwargs,
+                    priority=priority_enum,
+                    max_retries=max_retries,
+                )
+                submitted.append({'task_id': tid, 'index': i, 'func_name': func_name})
+
+            except Exception as e:
+                errors.append(f'Task {i}: {str(e)}')
+
+        return jsonify({
+            'submitted_tasks': submitted,
+            'submitted_count': len(submitted),
+            'errors': errors,
+            'error_count': len(errors)
+        }), (201 if submitted else 400)
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -115,17 +209,6 @@ def get_all_tasks():
         return jsonify({'error': str(e)}), 500
 
 
-@app.get('/stats')
-def get_system_stats():
-    tm, err = tm_or_503()
-    if err:
-        return err
-    try:
-        return jsonify(tm.get_stats())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
 @app.get('/tasks/types')
 def get_available_task_types():
     tm, err = tm_or_503()
@@ -138,58 +221,18 @@ def get_available_task_types():
         return jsonify({'error': str(e)}), 500
 
 
-@app.post('/tasks/bulk')
-def submit_bulk_tasks():
+@app.get('/stats')
+def get_system_stats():
     tm, err = tm_or_503()
     if err:
         return err
     try:
-        data = request.get_json()
-        if not data or 'tasks' not in data:
-            return jsonify({'error': 'tasks array is required'}), 400
-
-        submitted, errors = [], []
-        for i, t in enumerate(data['tasks']):
-            try:
-                func_name = t.get('func_name')
-                if not func_name:
-                    errors.append(f'Task {i}: func_name is required')
-                    continue
-
-                args = t.get('args', [])
-                kwargs = t.get('kwargs', {})
-                priority = t.get('priority', 'NORMAL')
-                max_retries = t.get('max_retries', 3)
-
-                try:
-                    priority_enum = TaskPriority[priority.upper()]
-                except KeyError:
-                    errors.append(f'Task {i}: Invalid priority {priority}')
-                    continue
-
-                # NOTE: named arguments here, too
-                tid = tm.submit_task(
-                    func_name=func_name,
-                    args=args,
-                    kwargs=kwargs,
-                    priority=priority_enum,
-                    max_retries=max_retries,
-                )
-                submitted.append({'task_id': tid, 'index': i, 'func_name': func_name})
-
-            except Exception as e:
-                errors.append(f'Task {i}: {str(e)}')
-
-        return jsonify({
-            'submitted_tasks': submitted,
-            'submitted_count': len(submitted),
-            'errors': errors,
-            'error_count': len(errors)
-        }), (201 if submitted else 400)
-
+        return jsonify(tm.get_stats())
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+# ---------- Error Handlers ----------
 
 @app.errorhandler(404)
 def not_found(_):
@@ -206,43 +249,11 @@ def internal_error(_):
     return jsonify({'error': 'Internal server error'}), 500
 
 
-@app.get('/examples')
-def get_examples():
-    return jsonify({
-        'submit_simple_task': {
-            'method': 'POST',
-            'url': '/tasks',
-            'body': {'func_name': 'add', 'args': [10, 20]}
-        },
-        'submit_priority_task': {
-            'method': 'POST',
-            'url': '/tasks',
-            'body': {'func_name': 'multiply', 'args': [5, 6], 'priority': 'HIGH', 'max_retries': 5}
-        },
-        'submit_task_with_kwargs': {
-            'method': 'POST',
-            'url': '/tasks',
-            'body': {'func_name': 'simulate_work', 'kwargs': {'duration': 3, 'fail': False}}
-        },
-        'submit_bulk_tasks': {
-            'method': 'POST',
-            'url': '/tasks/bulk',
-            'body': {'tasks': [
-                {'func_name': 'add', 'args': [1, 2]},
-                {'func_name': 'multiply', 'args': [3, 4], 'priority': 'HIGH'}
-            ]}
-        },
-        'get_task_status': {'method': 'GET', 'url': '/tasks/{task_id}'},
-        'get_all_tasks': {'method': 'GET', 'url': '/tasks?status=completed&limit=10'},
-        'get_stats': {'method': 'GET', 'url': '/stats'}
-    })
+# ---------- Entrypoint ----------
 
-
-# ... keep everything else the same above
 if __name__ == '__main__':
     import os
-    PORT = int(os.getenv("PORT", "5050"))  # <— use $PORT if provided
-
+    PORT = int(os.getenv("PORT", "5050"))  # Use $PORT if provided by platform
     print(f"Server starting on http://localhost:{PORT}")
     init_task_manager()
     try:
